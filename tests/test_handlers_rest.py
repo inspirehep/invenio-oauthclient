@@ -10,13 +10,18 @@
 
 from __future__ import absolute_import, print_function
 
+import json
+
 import pytest
 from flask import current_app, session, url_for
 from flask_login import current_user
 from flask_oauthlib.client import OAuth as FlaskOAuth
 from flask_security import login_user, logout_user
 from flask_security.confirmable import _security
-from helpers import check_redirect_location, check_response_redirect_url_args
+from helpers import check_redirect_location, \
+    check_response_redirect_url_args, mock_remote_get
+from invenio_accounts.models import User
+from werkzeug.exceptions import BadRequest
 from werkzeug.routing import BuildError
 
 from invenio_oauthclient import InvenioOAuthClientREST, current_oauthclient
@@ -132,6 +137,76 @@ def test_signup_handler(remote, app_rest, models_fixture):
     token_setter(remote, token, 'mysecret')
     with pytest.raises(BuildError):
         signup_handler(remote)
+
+
+def _signup_request_context(app, remote, body):
+    """Request context for the signup POST following an authorized callback."""
+    ctx = app.test_request_context(
+        method='POST', data=body, content_type='application/json')
+    ctx.push()
+    session_prefix = token_session_key(remote.name)
+    session[session_prefix] = ('mytoken', 'mysecret')
+    session[session_prefix + '_autoregister'] = True
+    session[session_prefix + '_account_info'] = {
+        'user': {'email': 'new@inveniosoftware.org'}}
+    session[session_prefix + '_response'] = {'access_token': 'mytoken'}
+    current_oauthclient.signup_handlers[remote.name] = {
+        'setup': lambda token, resp: None
+    }
+    return ctx
+
+
+@pytest.mark.parametrize('remote', REMOTE_APPS, indirect=["remote"])
+def test_signup_handler_post(remote, app_rest, models_fixture, example_cern):
+    """Test signup handler registers the user from the posted email."""
+    # Logging in triggers the CERN identity hook, which queries the remote.
+    mock_remote_get(current_app.extensions['oauthlib.client'], 'cern',
+                    example_cern[0])
+    email = 'new@inveniosoftware.org'
+    ctx = _signup_request_context(
+        app_rest, remote, json.dumps({'email': email}))
+    try:
+        resp = signup_handler(remote)
+        expected_url_args = {
+            "message": "Successfully signed up.",
+            "code": 200
+        }
+        check_response_redirect_url_args(resp, expected_url_args)
+        user = User.query.filter_by(email=email).one()
+        assert RemoteToken.get(user.id, remote.consumer_key)
+    finally:
+        ctx.pop()
+
+
+@pytest.mark.parametrize('remote', REMOTE_APPS, indirect=["remote"])
+@pytest.mark.parametrize('body', [
+    # Only the email may come from the client.
+    json.dumps({'email': 'new@inveniosoftware.org', 'active': True}),
+    json.dumps({'email': 'new@inveniosoftware.org', 'password': 'secret'}),
+    json.dumps({'email': 'new@inveniosoftware.org',
+                'confirmed_at': '2018-01-01'}),
+    json.dumps({'email': 'new@inveniosoftware.org',
+                'profile': {'username': 'admin'}}),
+    # Missing or invalid email.
+    json.dumps({}),
+    json.dumps({'mail': 'new@inveniosoftware.org'}),
+    json.dumps({'email': 123}),
+    json.dumps({'email': None}),
+    json.dumps({'email': ['new@inveniosoftware.org']}),
+])
+def test_signup_handler_post_invalid_data(remote, body, app_rest,
+                                          models_fixture):
+    """Test signup handler rejects anything but an email."""
+    users_before = User.query.count()
+    ctx = _signup_request_context(app_rest, remote, body)
+    try:
+        with pytest.raises(BadRequest):
+            signup_handler(remote)
+        assert User.query.count() == users_before
+        assert not User.query.filter_by(
+            email='new@inveniosoftware.org').count()
+    finally:
+        ctx.pop()
 
 
 @pytest.mark.parametrize('remote', REMOTE_APPS, indirect=["remote"])
