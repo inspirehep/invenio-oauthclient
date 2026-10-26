@@ -13,8 +13,8 @@ from __future__ import absolute_import, print_function
 from functools import partial, wraps
 
 import six
-from flask import current_app, flash, jsonify, redirect, render_template, \
-    request, session, url_for
+from flask import abort, current_app, flash, jsonify, redirect, \
+    render_template, request, session, url_for
 from flask_babelex import gettext as _
 from flask_login import current_user
 from invenio_db import db
@@ -312,8 +312,14 @@ def signup_handler(remote, *args, **kwargs):
         account_info = session.get(session_prefix + '_account_info')
         response = session.get(session_prefix + '_response')
 
+        # Only the email may come from the client.
+        data = request.get_json(silent=True)
+        if (not isinstance(data, dict) or set(data) != {'email'}
+                or not isinstance(data['email'], six.string_types)):
+            abort(400)
+
         # Register user
-        user = rest_oauth_register(request.json)
+        user = rest_oauth_register({'email': data['email']})
 
         if user is None:
             raise OAuthError('Could not create user.', remote)
